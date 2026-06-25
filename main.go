@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 
 	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/client-go/kubernetes"
@@ -78,6 +79,16 @@ type (
 		ctx             context.Context
 		k8sClient       *kubernetes.Clientset
 		namecheapClient NamecheapClient
+
+		// zoneMutexes serializes Present/CleanUp on a per-zone basis.
+		// Namecheap's SetHosts API is atomic *per zone* but replaces the
+		// entire host record set — concurrent challenges in the same zone
+		// race on the GetDomain → mutate → SetDomain window and silently
+		// lose each other's TXT records. Surfaced 2026-06-23 when 3
+		// _acme-challenge writes for *.zerosignage.io vanished from DNS
+		// despite the webhook reporting success to cert-manager.
+		// Key: zone string ("zerosignage.io"). Value: *sync.Mutex.
+		zoneMutexes sync.Map
 	}
 
 	// namecheapDNSProviderConfig is a structure that is used to decode into when
@@ -116,6 +127,17 @@ func (c *namecheapDNSProviderSolver) Name() string {
 	return "namecheap"
 }
 
+// lockZone returns an exclusive lock for the given Namecheap zone.
+// The returned func MUST be deferred immediately to release the lock.
+// Lazy-creates the per-zone mutex on first use via sync.Map.LoadOrStore
+// so concurrent first-time callers can't both win the create race.
+func (c *namecheapDNSProviderSolver) lockZone(zone string) func() {
+	m, _ := c.zoneMutexes.LoadOrStore(zone, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 // Present is responsible for actually presenting the DNS record with the
 // DNS provider.
 // This method should tolerate being called multiple times with the same value.
@@ -137,6 +159,8 @@ func (c *namecheapDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) erro
 			return err
 		}
 	}
+
+	defer c.lockZone(zone)()
 
 	d, err := c.namecheapClient.GetDomain(zone)
 	if err != nil {
@@ -174,6 +198,8 @@ func (c *namecheapDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) erro
 			return err
 		}
 	}
+
+	defer c.lockZone(zone)()
 
 	d, err := c.namecheapClient.GetDomain(zone)
 	if err != nil {
